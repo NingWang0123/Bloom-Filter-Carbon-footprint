@@ -140,9 +140,12 @@ def Find_Optimal_Parameters(c_min, c_max, num_group_min, num_group_max, R_sum, t
             keys = [url_s for score_s, url_s in zip(positive_sample['score'].values, positive_sample['url']) if score_s < thresholds[0].item()]
             bloom_filter.insert(keys)
 
-            test_keys = [url_s for score_s, url_s in zip(train_negative['score'].values, train_negative['url']) if score_s < thresholds[0].item()]
+            url_negative = train_negative[train_negative['score'] < thresholds[-2].item()]['url']
+            score_negative = train_negative[train_negative['score'] < thresholds[-2].item()]['score'].values
+
+            test_keys = [url_s for score_s, url_s in zip(score_negative, url_negative) if score_s < thresholds[0].item()]
             test_results = bloom_filter.test(test_keys)
-            FP_items = test_results.sum().item()
+            FP_items = test_results.sum().item()+ len(url_negative)
             print(f'False positive items: {FP_items}, Number of groups: {k_max}, c = {round(c.item(), 2)}')
 
             if FP_opt > FP_items:
