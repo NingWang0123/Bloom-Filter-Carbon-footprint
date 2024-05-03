@@ -1,176 +1,79 @@
+import torch
 import numpy as np
-import pandas as pd
-import cupy as cp
-from numba import cuda
 
-class Ada_BloomFilter_gpu:
+def hashfunc(length):
+    # Assuming a simple hash function for demonstration. Replace with an appropriate hash function.
+    return lambda x: hash(x) % length
+
+class Ada_BloomFilter():
     def __init__(self, n, hash_len, k_max):
         self.n = n
-        self.hash_len = hash_len
-        self.table = cp.zeros(self.hash_len, dtype=cp.uint32)
-        self.k_max = k_max
-        self.seeds = cp.random.randint(1, 99999999, size=k_max, dtype=cp.int32)
-
-    def insert(self, keys, k):
-        for key in keys:
-            for j in range(k):
-                t = (key * self.seeds[j] + j) % self.hash_len
-                self.table[t] += 1  # Increment to handle collisions
-
-    def test(self, keys, k):
-        results = cp.zeros(len(keys), dtype=cp.uint8)
-        for idx, key in enumerate(keys):
-            match = 0
-            for j in range(k):
-                t = (key * self.seeds[j] + j) % self.hash_len
-                if self.table[t] > 0:
-                    match += 1
-            results[idx] = 1 if match == k else 0
-        return results
-
-def sort_scores_gpu(input_scores):
-    return cp.sort(input_scores)
-
-def set_thresholds_gpu(scores_sorted, thresholds, num_piece, c, k_min, k_max):
-    for k in range(k_min, k_max):
-        i = k - k_min
-        index = max(0, len(scores_sorted) - int(num_piece * c ** i))
-        thresholds[-(i + 2)] = scores_sorted[index]
+        self.hash_len = int(hash_len)
+        self.h = []
+        for i in range(int(k_max)):
+            self.h.append(hashfunc(self.hash_len))
+        # Initialize the table on GPU
+        self.table = torch.zeros(self.hash_len, dtype=torch.int32, device='cuda')
+    
+    def insert(self, key, k):
+        for j in range(int(k)):
+            t = self.h[j](key)
+            self.table[t] = 1
+    
+    def test(self, key, k):
+        match = 0
+        for j in range(int(k)):
+            t = self.h[j](key)
+            match += 1 * (self.table[t] == 1)
+        return int(match == k)
 
 def Find_Optimal_Parameters(c_min, c_max, num_group_min, num_group_max, R_sum, train_negative, positive_sample):
-    c_set = cp.arange(c_min, c_max + 10**(-6), 0.1)
-    FP_opt = len(train_negative)
-    bloom_filter_opt, thresholds_opt, k_max_opt = None, None, None
+    c_set = torch.arange(c_min, c_max + 10**(-6), 0.1, device='cuda')
+    FP_opt = train_negative.shape[0]
 
+    k_min = 0
     for k_max in range(num_group_min, num_group_max + 1):
         for c in c_set:
-            tau = cp.sum(c ** cp.arange(0, k_max + 1))
-            bloom_filter = Ada_BloomFilter_gpu(positive_sample.shape[0], R_sum, k_max)
-            thresholds = cp.zeros(k_max + 1, dtype=cp.float32)
-            thresholds[-1] = 1.1
+            tau = torch.sum(c ** torch.arange(0, k_max - k_min + 1, 1, device='cuda'))
+            n = positive_sample.shape[0]
+            hash_len = R_sum
+            bloom_filter = Ada_BloomFilter(n, hash_len, k_max)
+            thresholds = torch.ones(k_max - k_min + 1, device='cuda') * 1.1
+            # Convert the last threshold to a numpy float to use in comparison with Pandas Series
+            last_threshold = thresholds[-1].item()
+            num_negative = (train_negative['score'] <= last_threshold).sum()
+            num_piece = int(num_negative / tau.item()) + 1
+            score = train_negative.loc[train_negative['score'] <= last_threshold, 'score'].values
+            score = torch.tensor(np.sort(score), device='cuda')
+            for k in range(k_min, k_max):
+                i = k - k_min
+                score_1 = score[score < torch.tensor(thresholds[-(i + 1)].item(), device='cuda')]
+                if int(num_piece * c.item() ** i) < len(score_1):
+                    thresholds[-(i + 2)] = score_1[-int(num_piece * c.item() ** i)]
 
-            score = cp.array(train_negative[train_negative['score'] <= thresholds[-1]]['score'].values)
-            scores_sorted = sort_scores_gpu(score)
-
-            num_negative = len(score)
-            num_piece = int(num_negative / tau) + 1
-            set_thresholds_gpu(scores_sorted, thresholds, num_piece, c, 0, k_max)
-
-            url = cp.array(positive_sample['url'].values)
-            score = cp.array(positive_sample['score'].values)
-
+            url = positive_sample['url']
+            score = positive_sample['score'].values
             for score_s, url_s in zip(score, url):
-                ix = cp.searchsorted(thresholds, score_s, side='right') - 1
+                ix = min((torch.tensor(score_s, device='cuda') < thresholds).nonzero().cpu().numpy()[0])
                 k = k_max - ix
-                bloom_filter.insert(cp.array([url_s]), k)
+                bloom_filter.insert(url_s, k)
 
-            url_negative = cp.array(train_negative[train_negative['score'] < thresholds[-2]]['url'].values)
-            test_results = bloom_filter.test(url_negative, k_max - cp.searchsorted(thresholds, train_negative[train_negative['score'] < thresholds[-2]]['score'].values, side='right'))
-
-            FP_items = int(cp.sum(test_results)) + len(train_negative[train_negative['score'] >= thresholds[-2]])
+            url_negative = train_negative.loc[train_negative['score'] < thresholds[-2].item(), 'url']
+            score_negative = train_negative.loc[train_negative['score'] < thresholds[-2].item(), 'score'].values
+            test_result = torch.zeros(len(url_negative), device='cuda')
+            ss = 0
+            for score_s, url_s in zip(score_negative, url_negative):
+                ix = min((torch.tensor(score_s, device='cuda') < thresholds).nonzero().cpu().numpy()[0])
+                k = k_max - ix
+                test_result[ss] = bloom_filter.test(url_s, k)
+                ss += 1
+            FP_items = torch.sum(test_result).item() + len(url_negative)
+            print(f'False positive items: {FP_items}, Number of groups: {k_max}, c = {round(c.item(), 2)}')
 
             if FP_opt > FP_items:
                 FP_opt = FP_items
                 bloom_filter_opt = bloom_filter
-                thresholds_opt = thresholds.get()  # Transfer back to host
+                thresholds_opt = thresholds
                 k_max_opt = k_max
 
-            print(f'False positive items: {FP_items}, Number of groups: {k_max}, c = {c:.2f}')
-
     return bloom_filter_opt, thresholds_opt, k_max_opt
-
-
-
-import numpy as np
-import pandas as pd
-import cupy as cp
-from numba import cuda
-
-class Ada_BloomFilter_gpu:
-    def __init__(self, n, hash_len, k_max):
-        self.n = n
-        self.hash_len = hash_len
-        self.table = cp.zeros(self.hash_len, dtype=cp.uint32)
-        self.k_max = k_max
-        self.seeds = cp.random.randint(1, 99999999, size=k_max, dtype=cp.int32)
-
-    def insert(self, keys, k):
-        for key in keys:
-            for j in range(k):
-                t = (key * self.seeds[j] + j) % self.hash_len
-                self.table[t] += 1  # Increment to handle collisions
-
-    def test(self, keys, k):
-        results = cp.zeros(len(keys), dtype=cp.uint8)
-        for idx, key in enumerate(keys):
-            match = 0
-            for j in range(k):
-                t = (key * self.seeds[j] + j) % self.hash_len
-                if self.table[t] > 0:
-                    match += 1
-            results[idx] = 1 if match == k else 0
-        return results
-
-def sort_scores_gpu(input_scores):
-    return cp.sort(input_scores)
-
-def set_thresholds_gpu(scores_sorted, thresholds, num_piece, c, k_min, k_max):
-    for k in range(k_min, k_max):
-        i = k - k_min
-        index = max(0, len(scores_sorted) - int(num_piece * c ** i))
-        thresholds[-(i + 2)] = scores_sorted[index]
-
-import cupy as cp
-import pandas as pd
-
-def Find_Optimal_Parameters(c_min, c_max, num_group_min, num_group_max, R_sum, train_negative, positive_sample):
-    c_set = cp.linspace(c_min, c_max, int((c_max - c_min) / 0.1 + 1))  
-    FP_opt = float('inf')
-    bloom_filter_opt, thresholds_opt, k_max_opt = None, None, None
-
-    # Ensure data from pandas is converted to CuPy arrays
-    train_scores = cp.array(train_negative['score'].values)
-    train_urls = np.array(train_negative['url'].values)
-    positive_scores = cp.array(positive_sample['score'].values)
-    positive_urls = np.array(positive_sample['url'].values)
-
-    for k_max in range(num_group_min, num_group_max + 1):
-        for c in c_set:
-            tau = cp.sum(c ** cp.arange(0, k_max + 1))
-            bloom_filter = Ada_BloomFilter_gpu(positive_sample.shape[0], R_sum, k_max)
-            thresholds = cp.zeros(k_max + 1, dtype=cp.float32)
-            thresholds[-1] = 1.1
-
-            # Filtering and sorting operations with CuPy
-            score_mask = train_scores <= thresholds[-1]
-            scores_sorted = cp.sort(train_scores[score_mask])
-
-            num_negative = scores_sorted.size
-            num_piece = int(num_negative / tau) + 1
-
-            for i in range(k_max):
-                idx = max(0, num_negative - int(num_piece * c ** i))
-                thresholds[k_max - 1 - i] = scores_sorted[idx]
-
-            # Bloom filter operations
-            for score, url in zip(positive_scores, positive_urls):
-                ix = cp.searchsorted(thresholds, score, side='right') - 1
-                k = k_max - ix
-                bloom_filter.insert(cp.array([url]), k)
-
-            negative_mask = train_scores < thresholds[-2]
-            test_results = bloom_filter.test(train_urls[negative_mask], k_max - cp.searchsorted(thresholds, train_scores[negative_mask], side='right'))
-
-            FP_items = int(cp.sum(test_results)) + (train_scores >= thresholds[-2]).sum()
-
-            if FP_opt > FP_items:
-                FP_opt = FP_items
-                bloom_filter_opt = bloom_filter
-                thresholds_opt = thresholds.get()  # Copy to host
-                k_max_opt = k_max
-
-            print(f'False positive items: {FP_items}, Number of groups: {k_max}, c = {c:.2f}')
-
-    return bloom_filter_opt, thresholds_opt, k_max_opt
-
-# Example usage, define your train_negative and positive_sample DataFrames
