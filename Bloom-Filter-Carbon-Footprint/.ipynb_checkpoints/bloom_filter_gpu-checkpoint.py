@@ -20,6 +20,17 @@ def test_kernel(table, k, hash_funcs_seeds, keys, result, m):
             t = (key * seed + 12345) % m
             match += table[t] == 1
         result[idx] = (match == k)
+        
+        
+@cuda.jit
+def insert_kernel(table, k, hash_funcs_seeds, keys, m):
+    idx = cuda.grid(1)
+    if idx < len(keys):
+        key = keys[idx]
+        for j in range(k):
+            seed = hash_funcs_seeds[j]
+            t = (key * seed + 12345) % m
+            cuda.atomic.add(table, t, 1)
 
 class BloomFilter_gpu():
     def __init__(self, n, hash_len):
