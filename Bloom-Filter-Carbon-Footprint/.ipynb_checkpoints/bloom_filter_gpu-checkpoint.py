@@ -6,29 +6,18 @@ import mmh3 as murmurhash3_32
 from numba import cuda
 import hashlib
 
-
 def consistent_hash(url):
-    # Ensure the hash fits within a 32-bit signed integer range
     return int(hashlib.sha256(url.encode('utf-8')).hexdigest(), 16) % (2**31 - 1)
-
-@cuda.jit
-def insert_kernel(table, k, hash_funcs_seeds, keys, m):
-    idx = cuda.grid(1)
-    if idx < len(keys):
-        key = keys[idx]
-        for j in range(k):
-            seed = hash_funcs_seeds[j]
-            t = (key * seed + 12345) % m
-            cuda.atomic.add(table, t, 1)
 
 @cuda.jit
 def test_kernel(table, k, hash_funcs_seeds, keys, result, m):
     idx = cuda.grid(1)
     if idx < len(keys):
         match = 0
+        key = keys[idx]
         for j in range(k):
             seed = hash_funcs_seeds[j]
-            t = (keys[idx] * seed + 12345) % m
+            t = (key * seed + 12345) % m
             match += table[t] == 1
         result[idx] = (match == k)
 
@@ -46,13 +35,16 @@ class BloomFilter_gpu():
         blocks_per_grid = (len(keys) + threads_per_block - 1) // threads_per_block
         insert_kernel[blocks_per_grid, threads_per_block](self.table, self.k, self.h_seeds, keys, self.hash_len)
 
-    def test(self, keys):
-        keys = np.array([consistent_hash(key) for key in keys], dtype=np.int32)
+    def test(self, keys, single_key=True):
+        keys = np.array([consistent_hash(key) for key in keys], dtype=np.int32) if not single_key else np.array([consistent_hash(keys)], dtype=np.int32)
         result = np.zeros(len(keys), dtype=np.uint8)
-        threads_per_block = 256
-        blocks_per_grid = (len(keys) + threads_per_block - 1) // threads_per_block
-        test_kernel[blocks_per_grid, threads_per_block](self.table, self.k, self.h_seeds, keys, result, self.hash_len)
-        return result
+        if self.hash_len > 0:
+            threads_per_block = 256
+            blocks_per_grid = (len(keys) + threads_per_block - 1) // threads_per_block
+            test_kernel[blocks_per_grid, threads_per_block](self.table, self.k, self.h_seeds, keys, result, self.hash_len)
+        if single_key:
+            return result[0]  
+        return result 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
