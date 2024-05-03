@@ -54,7 +54,7 @@ def Find_Optimal_Parameters(c_min, c_max, num_group_min, num_group_max, R_sum, t
             url = positive_sample['url']
             score = positive_sample['score'].values
             for score_s, url_s in zip(score, url):
-                ix = min((torch.tensor(score_s, device='cuda') < thresholds).nonzero().cpu().numpy()[0])
+                ix = torch.min((torch.tensor(score_s, device='cuda') < thresholds).nonzero()).item()
                 k = k_max - ix
                 bloom_filter.insert(url_s, k)
 
@@ -63,7 +63,7 @@ def Find_Optimal_Parameters(c_min, c_max, num_group_min, num_group_max, R_sum, t
             test_result = torch.zeros(len(url_negative), device='cuda')
             ss = 0
             for score_s, url_s in zip(score_negative, url_negative):
-                ix = min((torch.tensor(score_s, device='cuda') < thresholds).nonzero().cpu().numpy()[0])
+                ix = torch.min((torch.tensor(score_s, device='cuda') < thresholds).nonzero()).item()
                 k = k_max - ix
                 test_result[ss] = bloom_filter.test(url_s, k)
                 ss += 1
