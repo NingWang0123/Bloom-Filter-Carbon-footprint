@@ -290,3 +290,75 @@ def Find_Optimal_Parameters_CONCUR(c_min, c_max, num_group_min, num_group_max, R
                 non_empty_ix_opt = non_empty_ix
 
     return Bloom_Filters_opt, thresholds_opt, non_empty_ix_opt
+
+
+#### with test kernel
+class Ada_BloomFilter_GPU:
+    CUDA_BLOCK_SIZE = 128 
+    def __init__(self, n, hash_len, k_max):
+        self.n = n
+        self.hash_len = hash_len
+        self.k_max = k_max
+        self.seeds = cp.random.randint(1, 99999999, size=self.k_max, dtype=cp.uint32)
+        self.table = cp.zeros(self.hash_len, dtype=cp.uint32)
+
+        self.insert_kernel = cp.RawKernel(r'''
+unsigned int crc32b_m(const unsigned char *str, const unsigned int seed) {
+    // Source: https://stackoverflow.com/a/21001712
+    unsigned int byte, crc, mask;
+    int i = 0, j;
+    crc = 0xFFFFFFFF ^ seed;
+    while (str[i] != 0) {
+        byte = str[i];
+        crc = crc ^ byte;
+        for (j = 7; j >= 0; j--) {
+            mask = -(crc & 1);
+            crc = (crc >> 1) ^ (0xEDB88320 & mask);
+        }
+        i = i + 1;
+    }
+    return ~crc;
+}
+
+extern "C" __global__
+void insert_kernel(const unsigned char* url_str, const unsigned int* url_offsets, const unsigned int size, const unsigned int* k, unsigned int* table) {
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    if (tid < size) {
+      for (unsigned int i = 0; i < k[tid]; i++) {
+        unsigned int hash_value = crc32b_m(url_str+url_offsets[tid], i);
+        table[hash_value] = 1;
+      }
+    }
+}
+''', 'insert_kernel')
+        
+        self.test_kernel = cp.RawKernel(r'''
+extern "C" __global__ 
+void test_kernel(const unsigned char* keys, const unsigned int* offsets, const unsigned int* k, const unsigned int* seeds, unsigned int hash_len, const unsigned int* table, int total_keys, unsigned int* results) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= total_keys) return;
+
+    unsigned int key_start = offsets[idx];
+    unsigned int key_length = offsets[idx + 1] - key_start;
+    unsigned int match = 0;
+
+    for (int i = 0; i < k[idx]; i++) {
+        unsigned int hash = crc32b_m(keys + key_start, seeds[i]) % hash_len;
+        match += (table[hash] > 0);
+    }
+
+    results[idx] = (match == k[idx]);
+}
+''', 'test_kernel')
+
+    def insert(self, url_str_gpu, url_offset_gpu, k_list):
+        self.insert_kernel(
+            (math.ceil(len(url_offset_gpu)/CUDA_BLOCK_SIZE),),
+            (CUDA_BLOCK_SIZE,),
+            (url_str_gpu, url_offset_gpu, len(url_offset_gpu), k_list, self.table )
+        )
+
+    def test(self, keys_gpu, offsets_gpu, results_gpu):
+        num_blocks = (len(offsets_gpu) + self.CUDA_BLOCK_SIZE - 1) // self.CUDA_BLOCK_SIZE
+        self.test_kernel((num_blocks,), (self.CUDA_BLOCK_SIZE,), (keys_gpu, offsets_gpu, self.seeds, self.hash_len, self.table, len(offsets_gpu), results_gpu))
+        return results_gpu
